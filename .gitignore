@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Ambiente
+.env
+*.env.local
+
+# Banco de dados
+*.db
+*.sqlite3
+
+# Cache de dados
+data/*.json
+data/*.csv
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker
+*.log
+
+# macOS
+.DS_Store
