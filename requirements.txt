@@ -17,15 +17,18 @@ pydantic>=2.0
 
 # Banco de dados
 sqlalchemy>=2.0
-# Descomente para PostgreSQL em produção:
-# psycopg2-binary>=2.9
+# Driver PostgreSQL — necessário sempre que DATABASE_URL usar postgresql://,
+# que é exatamente o caso do docker-compose.yml. Com ele comentado, todos os
+# containers subiam e morriam com ModuleNotFoundError: No module named 'psycopg2'.
+psycopg2-binary>=2.9
 
 # Dashboard
-streamlit>=1.28
+# >=1.49 por causa do parâmetro `width` (substituto de use_container_width).
+streamlit>=1.49
 plotly>=5.18
 
 # Bot/agendador
 schedule>=1.2
 
 # Utilitários
-python-dotenv>=1.0   # carrega .env automaticamente
+python-dotenv>=1.0   # carrega .env (usado em config.py)

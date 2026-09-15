@@ -4,52 +4,80 @@ backend/main.py — API REST com FastAPI
 Endpoints:
   GET  /                     → health check
   GET  /times                → lista times disponíveis
-  GET  /previsoes            → histórico de previsões
+  GET  /contextos            → contextos de jogo e seus fatores
+  GET  /stats/{time}         → estatísticas de um time
   POST /analisar             → analisa uma partida
   POST /analisar/rodada      → analisa todos os jogos de uma rodada
+  GET  /previsoes            → histórico de previsões
   GET  /tabela/{campeonato}  → tabela de classificação
-  GET  /stats/{time}         → estatísticas de um time
 """
 
-import os
+from __future__ import annotations
+
+import logging
 import sys
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from backend.database import engine, SessionLocal
+from config import (
+    CAMPEONATO_ID_PADRAO,
+    CORS_ALLOW_CREDENTIALS,
+    CORS_ORIGINS,
+    VERSION,
+    configurar_logging,
+)
+from backend.database import engine, get_db
 from backend.models import Base, PrevisaoORM
-from model.engine import analisar_partida, MatchAnalysis
-from model.data import DataFetcher, CONTEXT_FACTORS, CONTEXT_DESCRIPTIONS
+from model.data import CONTEXT_DESCRIPTIONS, CONTEXT_FACTORS, DataFetcher, resolver_time
+from model.engine import MatchAnalysis, analisar_partida
 
-# Inicializa tabelas
-Base.metadata.create_all(bind=engine)
+configurar_logging()
+log = logging.getLogger(__name__)
+
+MODELO = "Poisson + Dixon-Coles + Monte Carlo"
+
+# Teto de partidas analisadas numa rodada — evita que uma resposta da API
+# externa com centenas de jogos trave a requisição.
+MAX_JOGOS_RODADA = 50
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    log.info("Futebol Elite API %s pronta.", VERSION)
+    yield
+
 
 app = FastAPI(
     title="Futebol Elite API",
     description="Sistema de análise estatística de futebol brasileiro",
-    version="2.0.0",
+    version=VERSION,
+    lifespan=lifespan,
 )
 
+# `allow_origins=["*"]` combinado com `allow_credentials=True` é rejeitado
+# pelos navegadores. config.py só habilita credenciais quando há uma lista
+# explícita de origens em CORS_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-fetcher = DataFetcher(
-    api_futebol_key=os.getenv("API_FUTEBOL_KEY"),
-    football_data_key=os.getenv("FOOTBALL_DATA_KEY"),
-)
+fetcher = DataFetcher()
 
 
 # ──────────────────────────────────────────
@@ -57,18 +85,25 @@ fetcher = DataFetcher(
 # ──────────────────────────────────────────
 
 class PartidaRequest(BaseModel):
-    home_team: str
-    away_team: str
-    competition: str = "Brasileirão Série A"
+    home_team: str = Field(min_length=1, max_length=80)
+    away_team: str = Field(min_length=1, max_length=80)
+    competition: str = Field(default="Brasileirão Série A", max_length=80)
     context: str = "normal"
     usar_monte_carlo: bool = False
-    mc_simulations: int = 10_000
+    mc_simulations: int = Field(default=10_000, ge=100, le=500_000)
 
 
 class RodadaRequest(BaseModel):
-    campeonato_id: int = 10
+    campeonato_id: int = Field(default=CAMPEONATO_ID_PADRAO, ge=1)
     context: str = "normal"
     usar_monte_carlo: bool = False
+
+
+class ScoreOut(BaseModel):
+    home: int
+    away: int
+    prob: float
+    label: str
 
 
 class PartidaResponse(BaseModel):
@@ -86,7 +121,7 @@ class PartidaResponse(BaseModel):
     total_goals_expected: float
     btts_prob: float
     over_2_5_prob: float
-    top_scores: list
+    top_scores: List[ScoreOut]
     mc_prob_home: Optional[float] = None
     mc_prob_draw: Optional[float] = None
     mc_prob_away: Optional[float] = None
@@ -94,9 +129,38 @@ class PartidaResponse(BaseModel):
     gerado_em: str
 
 
+class RodadaResponse(BaseModel):
+    partidas: int
+    resultados: List[PartidaResponse]
+
+
 # ──────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────
+
+def _agora_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _resolver_ou_erro(nome: str, papel: str) -> str:
+    """Traduz o nome do time ou devolve 400 com a lista de opções."""
+    canonico = resolver_time(nome)
+    if canonico is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Time {papel} '{nome}' não encontrado. Consulte GET /times.",
+        )
+    return canonico
+
+
+def _validar_contexto(context: str) -> float:
+    if context not in CONTEXT_FACTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Contexto inválido. Use um de: {list(CONTEXT_FACTORS)}",
+        )
+    return CONTEXT_FACTORS[context]
+
 
 def _analysis_to_response(analysis: MatchAnalysis) -> PartidaResponse:
     return PartidaResponse(
@@ -114,17 +178,18 @@ def _analysis_to_response(analysis: MatchAnalysis) -> PartidaResponse:
         total_goals_expected=analysis.total_goals_expected,
         btts_prob=analysis.btts_prob,
         over_2_5_prob=analysis.over_2_5_prob,
-        top_scores=[{"home": s.home, "away": s.away, "prob": s.prob} for s in analysis.top_scores[:8]],
+        top_scores=[ScoreOut(**s.to_dict()) for s in analysis.top_scores[:8]],
         mc_prob_home=analysis.mc_prob_home,
         mc_prob_draw=analysis.mc_prob_draw,
         mc_prob_away=analysis.mc_prob_away,
         mc_simulations=analysis.mc_simulations,
-        gerado_em=datetime.now().isoformat(),
+        gerado_em=_agora_iso(),
     )
 
 
-def _salvar_previsao(db, analysis: MatchAnalysis):
-    row = PrevisaoORM(
+def _nova_previsao(analysis: MatchAnalysis) -> PrevisaoORM:
+    """Monta a linha do histórico. O commit fica a cargo do chamador."""
+    return PrevisaoORM(
         time_casa=analysis.home_team,
         time_fora=analysis.away_team,
         competicao=analysis.competition,
@@ -139,11 +204,8 @@ def _salvar_previsao(db, analysis: MatchAnalysis):
         gols_esperados=analysis.total_goals_expected,
         btts=analysis.btts_prob,
         over_25=analysis.over_2_5_prob,
-        placar_mais_provavel=f"{analysis.top_scores[0].label}" if analysis.top_scores else "-",
+        placar_mais_provavel=analysis.top_scores[0].label if analysis.top_scores else "-",
     )
-    db.add(row)
-    db.commit()
-    return row
 
 
 # ──────────────────────────────────────────
@@ -154,9 +216,9 @@ def _salvar_previsao(db, analysis: MatchAnalysis):
 def health():
     return {
         "status": "online",
-        "versao": "2.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "modelo": "Poisson + Dixon-Coles + Monte Carlo",
+        "versao": VERSION,
+        "timestamp": _agora_iso(),
+        "modelo": MODELO,
     }
 
 
@@ -176,33 +238,28 @@ def listar_contextos():
 
 @app.get("/stats/{time_nome}")
 def stats_time(time_nome: str):
-    stats = fetcher.get_time_stats_formatado(time_nome)
-    if not stats:
-        raise HTTPException(status_code=404, detail=f"Time '{time_nome}' não encontrado")
-    return {"time": time_nome, "stats": stats}
+    canonico = resolver_time(time_nome)
+    if canonico is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Time '{time_nome}' não encontrado. Consulte GET /times.",
+        )
+    return {"time": canonico, "stats": fetcher.get_time_stats_formatado(canonico)}
 
 
 @app.post("/analisar", response_model=PartidaResponse)
-def analisar(req: PartidaRequest):
-    times = fetcher.listar_times()
-    if req.home_team not in times:
-        raise HTTPException(400, f"Time '{req.home_team}' não encontrado")
-    if req.away_team not in times:
-        raise HTTPException(400, f"Time '{req.away_team}' não encontrado")
-    if req.home_team == req.away_team:
+def analisar(req: PartidaRequest, db: Session = Depends(get_db)):
+    home = _resolver_ou_erro(req.home_team, "mandante")
+    away = _resolver_ou_erro(req.away_team, "visitante")
+    if home == away:
         raise HTTPException(400, "Selecione times diferentes")
-    if req.context not in CONTEXT_FACTORS:
-        raise HTTPException(400, f"Contexto inválido. Use: {list(CONTEXT_FACTORS.keys())}")
-
-    stats_home = fetcher.get_team_stats(req.home_team)
-    stats_away = fetcher.get_team_stats(req.away_team)
-    cf = CONTEXT_FACTORS[req.context]
+    cf = _validar_contexto(req.context)
 
     analysis = analisar_partida(
-        home_team=req.home_team,
-        away_team=req.away_team,
-        stats_home=stats_home,
-        stats_away=stats_away,
+        home_team=home,
+        away_team=away,
+        stats_home=fetcher.get_team_stats(home),
+        stats_away=fetcher.get_team_stats(away),
         competition=req.competition,
         context=req.context,
         context_factor=cf,
@@ -210,71 +267,74 @@ def analisar(req: PartidaRequest):
         mc_simulations=req.mc_simulations,
     )
 
-    db = SessionLocal()
-    try:
-        _salvar_previsao(db, analysis)
-    finally:
-        db.close()
+    db.add(_nova_previsao(analysis))
+    db.commit()
 
     return _analysis_to_response(analysis)
 
 
-@app.post("/analisar/rodada")
-def analisar_rodada(req: RodadaRequest):
+@app.post("/analisar/rodada", response_model=RodadaResponse)
+def analisar_rodada(req: RodadaRequest, db: Session = Depends(get_db)):
+    cf = _validar_contexto(req.context)
+
     jogos = fetcher.get_proximos_jogos(req.campeonato_id)
     if not jogos:
         raise HTTPException(404, "Nenhum jogo encontrado para esta rodada")
 
-    resultados = []
-    cf = CONTEXT_FACTORS.get(req.context, 1.0)
-    db = SessionLocal()
+    resultados: List[PartidaResponse] = []
+    for jogo in jogos[:MAX_JOGOS_RODADA]:
+        home, away = jogo.get("home", ""), jogo.get("away", "")
+        if not home or not away or home == away:
+            continue
 
-    try:
-        for jogo in jogos:
-            home, away = jogo.get("home", ""), jogo.get("away", "")
-            if not home or not away:
-                continue
+        analysis = analisar_partida(
+            home_team=home,
+            away_team=away,
+            stats_home=fetcher.get_team_stats(home),
+            stats_away=fetcher.get_team_stats(away),
+            context=req.context,
+            context_factor=cf,
+            usar_monte_carlo=req.usar_monte_carlo,
+        )
 
-            stats_home = fetcher.get_team_stats(home)
-            stats_away = fetcher.get_team_stats(away)
+        db.add(_nova_previsao(analysis))
+        resultados.append(_analysis_to_response(analysis))
 
-            analysis = analisar_partida(
-                home_team=home,
-                away_team=away,
-                stats_home=stats_home,
-                stats_away=stats_away,
-                context=req.context,
-                context_factor=cf,
-                usar_monte_carlo=req.usar_monte_carlo,
-            )
+    # Um único commit para a rodada inteira, em vez de um por partida.
+    db.commit()
 
-            _salvar_previsao(db, analysis)
-            resultados.append(_analysis_to_response(analysis))
-    finally:
-        db.close()
-
-    return {"partidas": len(resultados), "resultados": resultados}
+    return RodadaResponse(partidas=len(resultados), resultados=resultados)
 
 
 @app.get("/previsoes")
 def historico_previsoes(
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     time: Optional[str] = None,
+    db: Session = Depends(get_db),
 ):
-    db = SessionLocal()
-    try:
-        q = db.query(PrevisaoORM).order_by(PrevisaoORM.criado_em.desc())
-        if time:
-            q = q.filter(
-                (PrevisaoORM.time_casa == time) | (PrevisaoORM.time_fora == time)
-            )
-        rows = q.limit(limit).all()
-        return {"total": len(rows), "previsoes": [r.to_dict() for r in rows]}
-    finally:
-        db.close()
+    q = db.query(PrevisaoORM)
+    if time:
+        canonico = resolver_time(time) or time
+        q = q.filter(
+            (PrevisaoORM.time_casa == canonico) | (PrevisaoORM.time_fora == canonico)
+        )
+
+    total = q.count()
+    rows = (
+        q.order_by(PrevisaoORM.criado_em.desc(), PrevisaoORM.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "previsoes": [r.to_dict() for r in rows],
+    }
 
 
 @app.get("/tabela/{campeonato_id}")
-def tabela(campeonato_id: int = 10):
-    dados = fetcher.get_tabela(campeonato_id)
-    return {"campeonato_id": campeonato_id, "tabela": dados}
+def tabela(campeonato_id: int = CAMPEONATO_ID_PADRAO):
+    return {"campeonato_id": campeonato_id, "tabela": fetcher.get_tabela(campeonato_id)}

@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ─────────────────────────────────────────────────────────
 # Futebol Elite — Docker Compose
 #
@@ -13,7 +11,29 @@ version: "3.9"
 #   docker compose up --build
 #   docker compose up -d            # background
 #   docker compose logs -f bot      # acompanhar worker
+#
+# Credenciais e chaves saem do .env (veja .env.example). Os padrões abaixo
+# servem só para desenvolvimento local.
 # ─────────────────────────────────────────────────────────
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-futebol}:${POSTGRES_PASSWORD:-futebol123}@db:5432/${POSTGRES_DB:-futebol_elite}
+  # Containers não enxergam 127.0.0.1 uns dos outros — o dashboard e o bot
+  # precisam do nome do serviço para falar com a API.
+  API_BASE_URL: http://api:8000
+  API_FUTEBOL_KEY: ${API_FUTEBOL_KEY:-}
+  FOOTBALL_DATA_KEY: ${FOOTBALL_DATA_KEY:-}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  ENV: ${ENV:-production}
+
+x-app-build: &app-build
+  build: .
+  restart: unless-stopped
+  volumes:
+    - ./data:/app/data
+  depends_on:
+    db:
+      condition: service_healthy
 
 services:
 
@@ -23,68 +43,55 @@ services:
     container_name: futebol_db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: futebol
-      POSTGRES_PASSWORD: futebol123
-      POSTGRES_DB: futebol_elite
+      POSTGRES_USER: ${POSTGRES_USER:-futebol}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-futebol123}
+      POSTGRES_DB: ${POSTGRES_DB:-futebol_elite}
     volumes:
       - pg_data:/var/lib/postgresql/data
+    # Porta publicada só no loopback: o Postgres não fica exposto na rede.
+    # Comente esta seção se não precisar acessar o banco pelo host.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U futebol -d futebol_elite"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-futebol} -d ${POSTGRES_DB:-futebol_elite}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   # ── API REST ─────────────────────────────────────────
   api:
-    build: .
+    <<: *app-build
     container_name: futebol_api
-    restart: unless-stopped
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2
-    environment:
-      DATABASE_URL: postgresql://futebol:futebol123@db:5432/futebol_elite
-      API_FUTEBOL_KEY: ${API_FUTEBOL_KEY:-}
-      FOOTBALL_DATA_KEY: ${FOOTBALL_DATA_KEY:-}
+    environment: *app-env
     ports:
       - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
-    volumes:
-      - ./data:/app/data
 
   # ── Dashboard ─────────────────────────────────────────
   dashboard:
-    build: .
+    <<: *app-build
     container_name: futebol_dashboard
-    restart: unless-stopped
     command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
-    environment:
-      DATABASE_URL: postgresql://futebol:futebol123@db:5432/futebol_elite
-      API_FUTEBOL_KEY: ${API_FUTEBOL_KEY:-}
-      FOOTBALL_DATA_KEY: ${FOOTBALL_DATA_KEY:-}
+    environment: *app-env
     ports:
       - "8501:8501"
     depends_on:
-      - api
-    volumes:
-      - ./data:/app/data
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
 
   # ── Bot/Worker ────────────────────────────────────────
   bot:
-    build: .
+    <<: *app-build
     container_name: futebol_bot
-    restart: unless-stopped
     command: python bot/scheduler.py
-    environment:
-      DATABASE_URL: postgresql://futebol:futebol123@db:5432/futebol_elite
-      API_FUTEBOL_KEY: ${API_FUTEBOL_KEY:-}
-      FOOTBALL_DATA_KEY: ${FOOTBALL_DATA_KEY:-}
+    environment: *app-env
     depends_on:
-      - api
-    volumes:
-      - ./data:/app/data
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
 
 volumes:
   pg_data:
