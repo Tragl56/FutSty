@@ -7,6 +7,9 @@ venv/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Ambiente
 .env
@@ -16,9 +19,9 @@ build/
 *.db
 *.sqlite3
 
-# Cache de dados
-data/*.json
-data/*.csv
+# Cache e resultados locais (o diretório em si é versionado via .gitkeep)
+data/*
+!data/.gitkeep
 
 # Streamlit
 .streamlit/
@@ -33,3 +36,7 @@ data/*.csv
 
 # macOS
 .DS_Store
+
+# Cópias acidentais de metadados do Git
+.git copy/
+*.git.bak/

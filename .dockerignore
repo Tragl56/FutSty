@@ -1,0 +1,33 @@
+# Git
+.git
+.git copy
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Segredos e estado local — nunca entram na imagem
+.env
+*.env.local
+*.db
+*.sqlite3
+data/
+
+# Testes e docs
+tests/
+pytest.ini
+README.md
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.log

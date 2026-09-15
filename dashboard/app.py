@@ -2,8 +2,8 @@
 dashboard/app.py — Dashboard interativo de análise de futebol.
 
 Combina:
-  - Visual rico com Plotly (proj2)
-  - Integração com API REST FastAPI (proj1)
+  - Visual rico com Plotly
+  - Integração com a API REST FastAPI (persistência do histórico)
   - Monte Carlo, Dixon-Coles, xPoints, BTTS, Over 2.5
   - Exportação JSON
 
@@ -11,29 +11,42 @@ Rodar:
   streamlit run dashboard/app.py
 """
 
+from __future__ import annotations
+
 import json
 import sys
-import requests
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from model.data import DataFetcher, CONTEXT_FACTORS, CONTEXT_DESCRIPTIONS, FALLBACK_STATS
+from config import API_BASE_URL, APP_NAME, DATA_DIR, VERSION
+from model.data import (
+    CONTEXT_DESCRIPTIONS,
+    CONTEXT_FACTORS,
+    FALLBACK_STATS,
+    DataFetcher,
+)
 from model.engine import analisar_partida
+
+VERDE, VERMELHO, CINZA, LARANJA = "#00C853", "#F44336", "#78909C", "#FF9800"
+TRANSPARENTE = "rgba(0,0,0,0)"
 
 # ──────────────────────────────────────────
 # Config da página
 # ──────────────────────────────────────────
 st.set_page_config(
-    page_title="Futebol Elite — Análise BR",
+    page_title=f"{APP_NAME} — Análise BR",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -43,36 +56,70 @@ st.markdown("""
 <style>
   [data-testid="stMetricValue"] { font-size: 2.2rem !important; font-weight: 700; }
   .block-container { padding-top: 1rem; }
-  .metric-hero { text-align: center; padding: 1rem 0; }
-  .verde  { color: #00C853; }
-  .vermelho { color: #F44336; }
-  .cinza  { color: #9E9E9E; }
-  div[data-testid="metric-container"] { background: #1a1a2e; border-radius: 10px; padding: 12px; }
 </style>
 """, unsafe_allow_html=True)
+
 
 # ──────────────────────────────────────────
 # Estado & dados
 # ──────────────────────────────────────────
 @st.cache_resource
-def get_fetcher():
+def get_fetcher() -> DataFetcher:
     return DataFetcher()
+
 
 fetcher = get_fetcher()
 times_lista = fetcher.listar_times()
+
+
+def indice_padrao(times: List[str], preferido: str, alternativa: int = 0) -> int:
+    """
+    Índice do time preferido, ou uma posição válida qualquer.
+
+    `list.index()` direto levantava ValueError e derrubava o dashboard
+    inteiro caso FALLBACK_STATS mudasse e o time sumisse da lista.
+    """
+    try:
+        return times.index(preferido)
+    except ValueError:
+        return min(alternativa, max(len(times) - 1, 0))
+
+
+def api_get(caminho: str, timeout: float = 3.0) -> Optional[dict]:
+    """GET na API local. Devolve None quando a API está fora do ar."""
+    try:
+        resp = requests.get(f"{API_BASE_URL}{caminho}", timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def api_post(caminho: str, payload: dict, timeout: float = 5.0) -> Optional[dict]:
+    """POST na API local. Devolve None quando a API está fora do ar."""
+    try:
+        resp = requests.post(f"{API_BASE_URL}{caminho}", json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
 
 # ──────────────────────────────────────────
 # Sidebar
 # ──────────────────────────────────────────
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/football2.png", width=60)
-    st.title("Futebol Elite")
-    st.caption("Modelo Poisson + Dixon-Coles")
+    st.title(f"⚽ {APP_NAME}")
+    st.caption(f"Modelo Poisson + Dixon-Coles · v{VERSION}")
     st.divider()
 
     st.subheader("⚔️ Configurar Partida")
-    home_team = st.selectbox("🏠 Mandante", times_lista, index=times_lista.index("Flamengo"))
-    away_team = st.selectbox("✈️ Visitante", times_lista, index=times_lista.index("Palmeiras"))
+    home_team = st.selectbox(
+        "🏠 Mandante", times_lista, index=indice_padrao(times_lista, "Flamengo", 0)
+    )
+    away_team = st.selectbox(
+        "✈️ Visitante", times_lista, index=indice_padrao(times_lista, "Palmeiras", 1)
+    )
 
     st.divider()
     competicao = st.selectbox("🏆 Competição", [
@@ -84,16 +131,19 @@ with st.sidebar:
         "Amistoso",
     ])
 
-    context_labels = {k: f"{k}  —  {CONTEXT_DESCRIPTIONS[k]}" for k in CONTEXT_FACTORS}
-    context_sel = st.selectbox("🎯 Contexto", list(context_labels.values()))
-    context = [k for k, v in context_labels.items() if v == context_sel][0]
+    contextos = list(CONTEXT_FACTORS)
+    context = st.selectbox(
+        "🎯 Contexto",
+        contextos,
+        format_func=lambda k: f"{k}  —  {CONTEXT_DESCRIPTIONS.get(k, '')}",
+    )
 
     st.divider()
     usar_mc = st.checkbox("🎲 Simulação Monte Carlo (10k)", value=False)
     mostrar_matriz = st.checkbox("🔲 Mostrar matriz de resultados", value=True)
 
     st.divider()
-    analisar = st.button("🔍 Analisar Partida", use_container_width=True, type="primary")
+    analisar = st.button("🔍 Analisar Partida", width="stretch", type="primary")
 
     st.divider()
     page = st.radio("📋 Navegação", ["Análise", "Times", "Histórico"], label_visibility="collapsed")
@@ -128,7 +178,7 @@ if page == "Times":
         )
         fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
         fig.update_layout(height=380, showlegend=False, xaxis_tickangle=-30)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col2:
         fig2 = px.bar(
@@ -141,13 +191,13 @@ if page == "Times":
         )
         fig2.update_traces(texttemplate="%{text:.2f}", textposition="outside")
         fig2.update_layout(height=380, showlegend=False, xaxis_tickangle=-30)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     fig3 = px.scatter(
         df_times,
         x="Força Ataque", y="Fragilidade Defesa",
         text="Time",
-        title="Mapa Ataque × Defesa",
+        title="Mapa Ataque × Defesa  (canto inferior direito = melhores times)",
         color="ELO",
         color_continuous_scale="Plasma",
         size="ELO",
@@ -155,12 +205,11 @@ if page == "Times":
     )
     fig3.update_traces(textposition="top center")
     fig3.update_layout(height=500)
-    # Linhas de média
     fig3.add_hline(y=1.0, line_dash="dot", line_color="gray", annotation_text="Média Defesa")
     fig3.add_vline(x=1.0, line_dash="dot", line_color="gray", annotation_text="Média Ataque")
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width="stretch")
 
-    st.dataframe(df_times, use_container_width=True, hide_index=True)
+    st.dataframe(df_times, width="stretch", hide_index=True)
     st.stop()
 
 # ──────────────────────────────────────────
@@ -169,32 +218,38 @@ if page == "Times":
 if page == "Histórico":
     st.title("📜 Histórico de Análises")
 
-    try:
-        resp = requests.get("http://127.0.0.1:8000/previsoes?limit=100", timeout=3)
-        data = resp.json()
-        previsoes = data.get("previsoes", [])
+    dados = api_get("/previsoes?limit=100")
+    previsoes = (dados or {}).get("previsoes", [])
 
-        if previsoes:
-            df_h = pd.DataFrame(previsoes)
-            df_h["criado_em"] = pd.to_datetime(df_h["criado_em"]).dt.strftime("%d/%m %H:%M")
+    if previsoes:
+        df_h = pd.DataFrame(previsoes)
+        if "criado_em" in df_h:
+            df_h["criado_em"] = pd.to_datetime(
+                df_h["criado_em"], errors="coerce"
+            ).dt.strftime("%d/%m %H:%M")
 
-            cols_show = ["time_casa", "time_fora", "competicao", "prob_casa", "prob_empate",
-                         "prob_fora", "placar_mais_provavel", "gols_esperados", "criado_em"]
-            df_show = df_h[[c for c in cols_show if c in df_h.columns]]
+        cols_show = ["time_casa", "time_fora", "competicao", "prob_casa", "prob_empate",
+                     "prob_fora", "placar_mais_provavel", "gols_esperados", "criado_em"]
+        df_show = df_h[[c for c in cols_show if c in df_h.columns]]
 
-            st.metric("Total de análises", len(df_show))
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
-        else:
-            st.info("Nenhuma análise registrada ainda. Gere uma análise na aba principal.")
-    except Exception:
-        st.warning("API offline. Execute `uvicorn backend.main:app` para habilitar histórico persistente.")
+        st.metric("Total de análises", dados.get("total", len(df_show)))
+        st.dataframe(df_show, width="stretch", hide_index=True)
+    elif dados is not None:
+        st.info("Nenhuma análise registrada ainda. Gere uma análise na aba principal.")
+    else:
+        st.warning(
+            f"API offline em {API_BASE_URL}. "
+            "Inicie com `python main.py --api` para habilitar o histórico persistente."
+        )
 
-        data_files = sorted(Path(ROOT / "data").glob("resultados_*.json"), reverse=True)
-        if data_files:
-            with open(data_files[0]) as f:
-                hist = json.load(f)
-            st.caption(f"Exibindo arquivo: {data_files[0].name}")
-            st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True)
+        arquivos = sorted(DATA_DIR.glob("resultados_*.json"), reverse=True)
+        if arquivos:
+            try:
+                hist = json.loads(arquivos[0].read_text(encoding="utf-8"))
+                st.caption(f"Exibindo arquivo local: {arquivos[0].name}")
+                st.dataframe(pd.DataFrame(hist), width="stretch", hide_index=True)
+            except (OSError, ValueError) as e:
+                st.error(f"Não foi possível ler {arquivos[0].name}: {e}")
 
     st.stop()
 
@@ -202,7 +257,7 @@ if page == "Histórico":
 # Página: Análise (principal)
 # ──────────────────────────────────────────
 if not analisar:
-    st.title("⚽ Futebol Elite — Análise Estatística")
+    st.title(f"⚽ {APP_NAME} — Análise Estatística")
     st.markdown("""
     Sistema de previsão probabilística para o futebol brasileiro, baseado em:
 
@@ -218,11 +273,14 @@ if not analisar:
     """)
 
     with st.expander("📋 Times disponíveis"):
-        times_df = pd.DataFrame([
-            {"Time": t, "Nível": fetcher.get_time_stats_formatado(t)["nivel"]}
-            for t in times_lista
-        ])
-        st.dataframe(times_df, use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame([
+                {"Time": t, "Nível": fetcher.get_time_stats_formatado(t)["nivel"]}
+                for t in times_lista
+            ]),
+            width="stretch",
+            hide_index=True,
+        )
     st.stop()
 
 # ──────────────────────────────────────────
@@ -233,15 +291,12 @@ if home_team == away_team:
     st.stop()
 
 with st.spinner("Calculando probabilidades..."):
-    stats_home = fetcher.get_team_stats(home_team)
-    stats_away = fetcher.get_team_stats(away_team)
     cf = CONTEXT_FACTORS.get(context, 1.0)
-
     resultado = analisar_partida(
         home_team=home_team,
         away_team=away_team,
-        stats_home=stats_home,
-        stats_away=stats_away,
+        stats_home=fetcher.get_team_stats(home_team),
+        stats_away=fetcher.get_team_stats(away_team),
         competition=competicao,
         context=context,
         context_factor=cf,
@@ -249,23 +304,25 @@ with st.spinner("Calculando probabilidades..."):
         mc_simulations=10_000,
     )
 
-# Tenta persistir na API
-try:
-    requests.post("http://127.0.0.1:8000/analisar", json={
-        "home_team": home_team,
-        "away_team": away_team,
-        "competition": competicao,
-        "context": context,
-        "usar_monte_carlo": usar_mc,
-    }, timeout=2)
-except Exception:
-    pass
+# O cálculo acima é local (instantâneo e funciona offline); a API é chamada
+# apenas para gravar a previsão no histórico persistente.
+persistido = api_post("/analisar", {
+    "home_team": home_team,
+    "away_team": away_team,
+    "competition": competicao,
+    "context": context,
+    "usar_monte_carlo": usar_mc,
+}) is not None
 
 # ──────────────────────────────────────────
 # Header do jogo
 # ──────────────────────────────────────────
 st.markdown(f"# {home_team}  ×  {away_team}")
-st.caption(f"🏆 {competicao}  ·  🎯 Contexto: {context}  ·  🕐 {datetime.now():%d/%m/%Y %H:%M}")
+st.caption(
+    f"🏆 {competicao}  ·  🎯 Contexto: {context} (fator {cf:.2f})"
+    f"  ·  🕐 {datetime.now():%d/%m/%Y %H:%M}"
+    f"  ·  {'💾 salvo no histórico' if persistido else '⚠️ API offline — não salvo'}"
+)
 st.divider()
 
 # ──────────────────────────────────────────
@@ -279,13 +336,13 @@ c1.metric(f"🏠 {home_team}", f"{resultado.prob_home:.1%}", delta="Favorito" if
 c2.metric("🤝 Empate",       f"{resultado.prob_draw:.1%}")
 c3.metric(f"✈️ {away_team}", f"{resultado.prob_away:.1%}", delta="Favorito" if not is_home_fav else None)
 
-# Barra horizontal de probabilidades
+probs = [resultado.prob_home, resultado.prob_draw, resultado.prob_away]
 fig_prob = go.Figure(go.Bar(
-    x=[resultado.prob_home, resultado.prob_draw, resultado.prob_away],
+    x=probs,
     y=[home_team, "Empate", away_team],
     orientation="h",
-    marker_color=["#00C853", "#78909C", "#F44336"],
-    text=[f"{v:.1%}" for v in [resultado.prob_home, resultado.prob_draw, resultado.prob_away]],
+    marker_color=[VERDE, CINZA, VERMELHO],
+    text=[f"{v:.1%}" for v in probs],
     textposition="auto",
     textfont=dict(size=14, color="white"),
 ))
@@ -294,10 +351,10 @@ fig_prob.update_layout(
     margin=dict(l=0, r=0, t=8, b=0),
     showlegend=False,
     xaxis=dict(showticklabels=False, range=[0, 1]),
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
+    paper_bgcolor=TRANSPARENTE,
+    plot_bgcolor=TRANSPARENTE,
 )
-st.plotly_chart(fig_prob, use_container_width=True)
+st.plotly_chart(fig_prob, width="stretch")
 
 st.divider()
 
@@ -306,10 +363,10 @@ st.divider()
 # ──────────────────────────────────────────
 st.subheader("📈 Métricas Avançadas")
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("⚽ Gols Esperados (λ total)",   f"{resultado.total_goals_expected:.2f}")
-m2.metric("🎯 BTTS (ambos marcam)",         f"{resultado.btts_prob:.1%}")
-m3.metric("📈 Over 2.5 gols",               f"{resultado.over_2_5_prob:.1%}")
-m4.metric("🏠 λ Casa / ✈️ Fora",            f"{resultado.lambda_home:.2f} / {resultado.lambda_away:.2f}")
+m1.metric("⚽ Gols Esperados (λ total)", f"{resultado.total_goals_expected:.2f}")
+m2.metric("🎯 BTTS (ambos marcam)",      f"{resultado.btts_prob:.1%}")
+m3.metric("📈 Over 2.5 gols",            f"{resultado.over_2_5_prob:.1%}")
+m4.metric("🏠 λ Casa / ✈️ Fora",         f"{resultado.lambda_home:.2f} / {resultado.lambda_away:.2f}")
 
 st.divider()
 
@@ -318,40 +375,36 @@ st.divider()
 # ──────────────────────────────────────────
 col_l, col_x = st.columns(2)
 
-with col_l:
-    st.subheader("Gols Esperados (λ)")
-    df_lmb = pd.DataFrame({
-        "Time": [home_team, away_team],
-        "λ":    [resultado.lambda_home, resultado.lambda_away],
-    })
-    fig_l = px.bar(
-        df_lmb, x="Time", y="λ",
+
+def barra_dupla(titulo: str, coluna: str, valores: List[float], y_range=None):
+    df = pd.DataFrame({"Time": [home_team, away_team], coluna: valores})
+    fig = px.bar(
+        df, x="Time", y=coluna,
         color="Time",
-        color_discrete_sequence=["#00C853", "#F44336"],
-        text="λ", height=260,
+        color_discrete_sequence=[VERDE, VERMELHO],
+        text=coluna, height=260,
     )
-    fig_l.update_traces(texttemplate="%{text:.2f}", textposition="outside")
-    fig_l.update_layout(showlegend=False, margin=dict(t=10, b=10, l=0, r=0),
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig_l, use_container_width=True)
+    fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(t=10, b=10, l=0, r=0),
+        yaxis=dict(range=y_range) if y_range else None,
+        paper_bgcolor=TRANSPARENTE,
+        plot_bgcolor=TRANSPARENTE,
+    )
+    st.subheader(titulo)
+    st.plotly_chart(fig, width="stretch")
+
+
+with col_l:
+    barra_dupla("Gols Esperados (λ)", "λ", [resultado.lambda_home, resultado.lambda_away])
 
 with col_x:
-    st.subheader("xPoints (Pontos Esperados)")
-    df_xp = pd.DataFrame({
-        "Time":    [home_team, away_team],
-        "xPoints": [resultado.xpoints_home, resultado.xpoints_away],
-    })
-    fig_x = px.bar(
-        df_xp, x="Time", y="xPoints",
-        color="Time",
-        color_discrete_sequence=["#00C853", "#F44336"],
-        text="xPoints", height=260,
+    barra_dupla(
+        "xPoints (Pontos Esperados)", "xPoints",
+        [resultado.xpoints_home, resultado.xpoints_away],
+        y_range=[0, 3.2],
     )
-    fig_x.update_traces(texttemplate="%{text:.2f}", textposition="outside")
-    fig_x.update_layout(showlegend=False, margin=dict(t=10, b=10, l=0, r=0),
-                        yaxis=dict(range=[0, 3.2]),
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig_x, use_container_width=True)
 
 st.divider()
 
@@ -366,14 +419,14 @@ with col_s:
         {"Placar": s.label, "Prob (%)": round(s.prob * 100, 2)}
         for s in resultado.top_scores[:10]
     ])
-    # Destaque para o mais provável
-    def highlight_top(row):
-        if row.name == 0:
-            return ["background-color: #1b5e20; font-weight:bold"] * len(row)
-        return [""] * len(row)
+
+    def destacar_primeiro(row):
+        estilo = "background-color: #1b5e20; font-weight:bold" if row.name == 0 else ""
+        return [estilo] * len(row)
+
     st.dataframe(
-        scores_df.style.apply(highlight_top, axis=1),
-        use_container_width=True,
+        scores_df.style.apply(destacar_primeiro, axis=1),
+        width="stretch",
         hide_index=True,
         height=360,
     )
@@ -381,27 +434,26 @@ with col_s:
 with col_m:
     if mostrar_matriz:
         st.subheader("🔲 Matriz de Resultados (%)")
-        mx = np.array(resultado.score_matrix)[:7, :7] * 100
+        matriz = np.array(resultado.score_matrix)
+        lado = min(7, matriz.shape[0])
+        mx = matriz[:lado, :lado] * 100
         fig_h = px.imshow(
             mx,
-            labels=dict(
-                x=f"Gols {away_team}",
-                y=f"Gols {home_team}",
-                color="Prob (%)",
-            ),
-            x=[str(i) for i in range(7)],
-            y=[str(i) for i in range(7)],
+            labels=dict(x=f"Gols {away_team}", y=f"Gols {home_team}", color="Prob (%)"),
+            x=[str(i) for i in range(lado)],
+            y=[str(i) for i in range(lado)],
             color_continuous_scale="YlGn",
             text_auto=".1f",
             aspect="auto",
             height=360,
         )
-        fig_h.update_layout(
-            margin=dict(t=20, b=10, l=0, r=0),
-            paper_bgcolor="rgba(0,0,0,0)",
+        fig_h.update_layout(margin=dict(t=20, b=10, l=0, r=0), paper_bgcolor=TRANSPARENTE)
+        st.plotly_chart(fig_h, width="stretch")
+        st.caption(
+            f"Cada célula = P(placar). Diagonal = empates. "
+            f"Triângulo inferior = vitória do mandante. "
+            f"Exibindo 0–{lado - 1} gols de uma matriz {matriz.shape[0]}×{matriz.shape[1]}."
         )
-        st.plotly_chart(fig_h, use_container_width=True)
-        st.caption("Cada célula = P(placar). Diagonal = empates. Triângulo inferior = vitória do mandante.")
 
 st.divider()
 
@@ -416,28 +468,27 @@ if usar_mc and resultado.mc_simulations > 0:
     mc2.metric("🤝 Empate",       f"{resultado.mc_prob_draw:.1%}")
     mc3.metric(f"✈️ {away_team}", f"{resultado.mc_prob_away:.1%}")
 
-    # Comparação Poisson × Monte Carlo
-    diff_h = abs(resultado.prob_home - resultado.mc_prob_home) * 100
-    diff_d = abs(resultado.prob_draw - resultado.mc_prob_draw) * 100
-    diff_a = abs(resultado.prob_away - resultado.mc_prob_away) * 100
-
     df_comp = pd.DataFrame({
         "Resultado":   [home_team, "Empate", away_team],
-        "Poisson":     [resultado.prob_home, resultado.prob_draw, resultado.prob_away],
+        "Poisson":     probs,
         "Monte Carlo": [resultado.mc_prob_home, resultado.mc_prob_draw, resultado.mc_prob_away],
     })
     fig_comp = px.bar(
         df_comp.melt(id_vars="Resultado", var_name="Modelo", value_name="Probabilidade"),
         x="Resultado", y="Probabilidade", color="Modelo",
         barmode="group",
-        color_discrete_map={"Poisson": "#00C853", "Monte Carlo": "#FF9800"},
+        color_discrete_map={"Poisson": VERDE, "Monte Carlo": LARANJA},
         text_auto=".1%",
         height=300,
         title="Comparação: Poisson vs Monte Carlo",
     )
-    fig_comp.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig_comp, use_container_width=True)
-    st.caption(f"Divergência máxima Poisson × MC: {max(diff_h, diff_d, diff_a):.1f}pp")
+    fig_comp.update_layout(paper_bgcolor=TRANSPARENTE, plot_bgcolor=TRANSPARENTE)
+    st.plotly_chart(fig_comp, width="stretch")
+    st.caption(
+        f"Divergência máxima Poisson × MC: {resultado.mc_max_divergencia:.1f}pp — "
+        "as duas curvas descrevem a mesma distribuição, então o que sobra é "
+        "apenas ruído de amostragem (~1/√n)."
+    )
     st.divider()
 
 # ──────────────────────────────────────────
@@ -445,16 +496,17 @@ if usar_mc and resultado.mc_simulations > 0:
 # ──────────────────────────────────────────
 st.subheader("⬇️ Exportar Análise")
 export_data = {
-    "partida":          f"{home_team} × {away_team}",
-    "competicao":       competicao,
-    "contexto":         context,
-    "fator_contexto":   cf,
-    "lambda_home":      resultado.lambda_home,
-    "lambda_away":      resultado.lambda_away,
+    "versao_modelo":  VERSION,
+    "partida":        f"{home_team} × {away_team}",
+    "competicao":     competicao,
+    "contexto":       context,
+    "fator_contexto": cf,
+    "lambda_home":    resultado.lambda_home,
+    "lambda_away":    resultado.lambda_away,
     "probabilidades": {
-        "casa":    resultado.prob_home,
-        "empate":  resultado.prob_draw,
-        "fora":    resultado.prob_away,
+        "casa":   resultado.prob_home,
+        "empate": resultado.prob_draw,
+        "fora":   resultado.prob_away,
     },
     "metricas": {
         "gols_esperados": resultado.total_goals_expected,
@@ -465,21 +517,25 @@ export_data = {
     },
     "top_scores": [{"placar": s.label, "prob": s.prob} for s in resultado.top_scores[:8]],
     "monte_carlo": {
-        "simulacoes":  resultado.mc_simulations,
-        "prob_home":   resultado.mc_prob_home,
-        "prob_draw":   resultado.mc_prob_draw,
-        "prob_away":   resultado.mc_prob_away,
+        "simulacoes": resultado.mc_simulations,
+        "prob_home":  resultado.mc_prob_home,
+        "prob_draw":  resultado.mc_prob_draw,
+        "prob_away":  resultado.mc_prob_away,
     } if resultado.mc_simulations > 0 else None,
     "gerado_em": datetime.now().isoformat(),
 }
 
-safe_home = home_team.lower().replace(" ", "_").replace("-", "")
-safe_away = away_team.lower().replace(" ", "_").replace("-", "")
+
+def nome_arquivo(time_a: str, time_b: str) -> str:
+    """Nome de arquivo ASCII-safe, sem acento nem espaço."""
+    from model.data import normalizar_nome
+    return f"analise_{normalizar_nome(time_a)}_vs_{normalizar_nome(time_b)}.json"
+
 
 st.download_button(
     "📥 Baixar JSON",
     data=json.dumps(export_data, ensure_ascii=False, indent=2),
-    file_name=f"analise_{safe_home}_vs_{safe_away}.json",
+    file_name=nome_arquivo(home_team, away_team),
     mime="application/json",
-    use_container_width=True,
+    width="stretch",
 )
