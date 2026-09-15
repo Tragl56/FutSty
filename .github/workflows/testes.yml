@@ -1,0 +1,54 @@
+name: Testes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Um push novo no mesmo branch cancela a execução anterior, que já está obsoleta.
+concurrency:
+  group: testes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Sem fail-fast: um leg vermelho não deve esconder o resultado dos outros.
+      fail-fast: false
+      matrix:
+        include:
+          # 3.11 é a versão do Dockerfile, ou seja, a que roda em produção.
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          # A CLI só quebra por encoding quando o stdout não é console, e isso
+          # é específico do Windows (cp1252). Sem este leg, uma regressão do
+          # UnicodeEncodeError passaria batida pelo CI.
+          - os: windows-latest
+            python: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Instala as dependências
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest
