@@ -421,11 +421,20 @@ with col_s:
     ])
 
     def destacar_primeiro(row):
-        estilo = "background-color: #1b5e20; font-weight:bold" if row.name == 0 else ""
+        # Texto branco junto com o fundo escuro: sem isso o placar mais
+        # provável fica preto sobre verde-escuro e some.
+        estilo = (
+            "background-color: #1b5e20; color: white; font-weight: bold"
+            if row.name == 0 else ""
+        )
         return [estilo] * len(row)
 
     st.dataframe(
-        scores_df.style.apply(destacar_primeiro, axis=1),
+        # O Styler ignora o round() do DataFrame e renderiza o float cru
+        # ("9.250000"); o format fixa as duas casas na exibição.
+        scores_df.style
+        .apply(destacar_primeiro, axis=1)
+        .format({"Prob (%)": "{:.2f}"}),
         width="stretch",
         hide_index=True,
         height=360,
