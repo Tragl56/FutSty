@@ -14,6 +14,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,10 +30,50 @@ from model.engine import analisar_partida
 
 SEPARADORES = (" vs ", " x ", " × ", " X ", " VS ", " v ")
 
+# Handlers de erro de codificação que degradam o caractere em vez de levantar.
+_ERROS_TOLERANTES = frozenset({
+    "replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "ignore",
+})
+
 
 # ──────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────
+
+def _tolerar_encoding_da_saida() -> None:
+    """
+    Impede que um `print` derrube a CLI por causa do encoding da saída.
+
+    No Windows, quando o stdout não é um console — redirecionado para arquivo ou
+    pipe, Task Scheduler, launcher de IDE — o Python usa o encoding do locale
+    (cp1252), que não representa ⭐, ⚽, λ nem emoji. Sem isto,
+    `python main.py --listar > out.txt` morre com UnicodeEncodeError, e
+    `--api`/`--dashboard` morrem no print de abertura, antes de o servidor subir.
+
+    Mantemos o encoding do stream e trocamos só o tratamento de erro, em vez de
+    forçar utf-8: quem redireciona para arquivo no Windows costuma abrir o
+    resultado no Notepad ou com `Get-Content`, que leem arquivo sem BOM como
+    cp1252 — gravar utf-8 exibiria "SÃ£o Paulo" no lugar de "São Paulo". Com
+    "replace", só a decoração vira "?" e os acentos, que cp1252 tem, continuam
+    corretos. Em Linux/Docker (utf-8) nada muda: nada falha ao codificar.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        # Nem todo stdout é um TextIOWrapper: com pythonw.exe ele pode ser None,
+        # e captura de teste ou wrappers de terceiros podem não ter reconfigure().
+        if not hasattr(stream, "reconfigure"):
+            continue
+        # Quem já tem um handler que nunca levanta fica como está: é o caso do
+        # stderr, que nasce com "backslashreplace", e de quem escolheu o seu via
+        # PYTHONIOENCODING. Note que "strict" não é o único que quebra:
+        # o stdout redirecionado no Windows vem com "surrogateescape", que
+        # também levanta UnicodeEncodeError para caractere fora da tabela.
+        if getattr(stream, "errors", None) in _ERROS_TOLERANTES:
+            continue
+        try:
+            stream.reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass  # stream não reconfigurável — melhor seguir do que morrer aqui
+
 
 def _resolver(nome: str, papel: str) -> Optional[str]:
     """Resolve o nome do time, imprimindo uma dica útil quando falha."""
@@ -155,9 +196,19 @@ def _rodar(comando: List[str], descricao: str) -> int:
     Usa `sys.executable -m ...` em vez do binário solto no PATH: assim o
     serviço sobe com o mesmo interpretador/venv que rodou este script.
     """
-    print(descricao)
+    # flush: com a saída redirecionada o buffer só esvaziaria no fim, e esta
+    # linha apareceria depois dos logs do serviço que ela anuncia.
+    print(descricao, flush=True)
+
+    # O subprocesso herda este stdout. Se for pipe/arquivo no Windows, o
+    # uvicorn/streamlit também assumiria cp1252 e morreria no primeiro log com
+    # caractere fora da tabela — e aí não há print nosso para proteger. UTF-8
+    # mode resolve na origem; setdefault respeita quem já definiu a variável.
+    env = dict(os.environ)
+    env.setdefault("PYTHONUTF8", "1")
+
     try:
-        return subprocess.run(comando, check=False).returncode
+        return subprocess.run(comando, check=False, env=env).returncode
     except FileNotFoundError:
         print(f"[ERRO] Não foi possível executar: {' '.join(comando)}")
         print("       Instale as dependências com: pip install -r requirements.txt")
@@ -188,6 +239,8 @@ def iniciar_dashboard() -> int:
 # ──────────────────────────────────────────
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _tolerar_encoding_da_saida()
+
     parser = argparse.ArgumentParser(
         description=f"⚽ {APP_NAME} — Sistema de Análise Estatística",
         formatter_class=argparse.RawDescriptionHelpFormatter,

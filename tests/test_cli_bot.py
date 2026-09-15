@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import sys
 
 import pytest
 
@@ -74,6 +76,92 @@ def test_version(capsys):
         cli.main(["--version"])
     assert e.value.code == 0
     assert "Futebol Elite" in capsys.readouterr().out
+
+
+# ── Encoding da saída ──────────────────────
+
+def _simular_stdout_cp1252(monkeypatch) -> io.TextIOWrapper:
+    """
+    Troca o stdout por um stream cp1252, como o que o Windows entrega quando a
+    saída não é um console: redirecionada para arquivo ou pipe, Task Scheduler,
+    launcher de IDE. No console interativo o Python usa utf-8 (PEP 528) e no
+    Docker/Linux o locale já é utf-8 — por isso o bug passava despercebido.
+
+    É helper, e não fixture, de propósito: ao iniciar a fase de call o pytest
+    reatribui sys.stdout ao próprio buffer de captura, o que desfaria um
+    monkeypatch aplicado lá no setup — e o teste passaria a medir nada.
+    """
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", stream)
+    return stream
+
+
+def _texto(stream: io.TextIOWrapper) -> str:
+    stream.flush()
+    return stream.buffer.getvalue().decode("cp1252")
+
+
+def test_listar_com_stdout_cp1252(monkeypatch):
+    """Regressão: as estrelas de `nivel` matavam `main.py --listar > out.txt`."""
+    stdout = _simular_stdout_cp1252(monkeypatch)
+
+    assert cli.main(["--listar"]) == 0
+
+    saida = _texto(stdout)
+    assert "times disponíveis" in saida
+    assert "?" in saida          # ⭐ degradado, em vez de UnicodeEncodeError
+
+
+def test_partida_com_stdout_cp1252(monkeypatch):
+    """`summary()` imprime ⚽ e λ, que não existem em cp1252."""
+    stdout = _simular_stdout_cp1252(monkeypatch)
+
+    assert cli.main(["--partida", "Flamengo vs Palmeiras"]) == 0
+
+    saida = _texto(stdout)
+    assert "Flamengo" in saida
+    assert "Palmeiras" in saida
+    assert "Probabilidades" in saida
+
+
+def test_cp1252_preserva_acentos(monkeypatch):
+    """
+    Só a decoração degrada. Forçar utf-8 gravaria "SÃ£o Paulo" para quem abre o
+    arquivo no Notepad ou com Get-Content; por isso o fix mantém o encoding do
+    stream e mexe só no tratamento de erro.
+    """
+    stdout = _simular_stdout_cp1252(monkeypatch)
+
+    assert cli.main(["--partida", "sao paulo vs CR Flamengo"]) == 0
+
+    assert stdout.encoding == "cp1252"
+    assert "São Paulo" in _texto(stdout)
+
+
+def test_stdout_surrogateescape_tambem_e_tratado(monkeypatch):
+    """
+    O stdout redirecionado no Windows não vem com "strict", e sim com
+    "surrogateescape" — que também levanta UnicodeEncodeError para caractere
+    fora da tabela. Um fix que só tratasse "strict" não pegaria o caso real.
+    """
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="surrogateescape")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    assert cli.main(["--listar"]) == 0
+    assert stream.errors == "replace"
+
+
+def test_stderr_backslashreplace_e_preservado(monkeypatch):
+    """
+    O stderr já nasce com "backslashreplace", que nunca levanta e mostra o
+    código do caractere. Mexer nele só trocaria "\u2b50" por "?" — e mudaria,
+    sem ganho, o comportamento no Linux.
+    """
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="backslashreplace")
+    monkeypatch.setattr(sys, "stderr", stream)
+
+    assert cli.main(["--listar"]) == 0
+    assert stream.errors == "backslashreplace"
 
 
 # ── Worker ─────────────────────────────────
